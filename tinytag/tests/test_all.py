@@ -14,6 +14,7 @@ from pathlib import Path
 from platform import python_implementation, system
 from sys import stdout
 from unittest import skipIf, TestCase
+from zlib import compress
 
 from tinytag import ParseError, TinyTagException, UnsupportedFormatError
 from tinytag import Image, Images, OtherFields, OtherImages, TinyTag
@@ -29,6 +30,53 @@ if TYPE_CHECKING:
 else:
     ExpectedTag = dict
     ExpectedImages = dict
+
+
+def _syncsafe(value: int) -> bytes:
+    return bytes((
+        (value >> 21) & 0x7F, (value >> 14) & 0x7F,
+        (value >> 7) & 0x7F, value & 0x7F))
+
+
+def _unsync_encode(data: bytes) -> bytes:
+    # Insert a zero byte after every 0xFF byte that is followed by
+    # another 0xFF-sync-like byte (0x00 or 0xE0-0xFF), per the ID3v2
+    # unsynchronisation scheme.
+    result = bytearray()
+    for index, byte in enumerate(data):
+        result.append(byte)
+        if byte == 0xFF:
+            next_byte = data[index + 1] if index + 1 < len(data) else 0
+            if next_byte == 0x00 or next_byte >= 0xE0:
+                result.append(0x00)
+    return bytes(result)
+
+
+def _make_id3v2_tag(major: int,
+                    frames: bytes,
+                    flags: int = 0,
+                    extended_header: bytes = b'') -> bytes:
+    body = extended_header + frames + b'\x00' * 16  # padding
+    if flags & 0x80 and major < 4:
+        # ID3v2.2/v2.3 unsynchronise the tag as a whole
+        body = _unsync_encode(body)
+    return b'ID3' + bytes((major, 0, flags)) + _syncsafe(len(body)) + body
+
+
+def _make_v22_frame(frame_id: bytes, data: bytes) -> bytes:
+    return frame_id + len(data).to_bytes(3, 'big') + data
+
+
+def _make_v23_frame(frame_id: bytes, data: bytes,
+                    format_flags: int = 0) -> bytes:
+    return (frame_id + len(data).to_bytes(4, 'big')
+            + bytes((0, format_flags)) + data)
+
+
+def _make_v24_frame(frame_id: bytes, data: bytes,
+                    format_flags: int = 0) -> bytes:
+    return frame_id + _syncsafe(len(data)) + bytes((0, format_flags)) + data
+
 
 TEST_FILES: dict[str, ExpectedTag] = dict([
     ('vbri.mp3', {
@@ -3520,6 +3568,179 @@ class TestAll(TestCase):
                 with self.assertRaises(UnsupportedFormatError) as context:
                     TinyTag.get(filename, check_magic_bytes=False)
                 self.assertIsInstance(context.exception, TinyTagException)
+
+    @staticmethod
+    def _get_constructed_tag(tag_data: bytes, image: bool = False) -> TinyTag:
+        return TinyTag.get(
+            file_obj=BytesIO(tag_data), duration=False, image=image)
+
+    def test_id3v23_extended_header(self) -> None:
+        # Extended header: 4-byte size (excluding itself), 2 flag bytes,
+        # 4-byte padding size, optional 4-byte CRC (flag 0x8000)
+        extended_header = (
+            (10).to_bytes(4, 'big') + b'\x80\x00'
+            + (0).to_bytes(4, 'big') + b'\xde\xad\xbe\xef')
+        frames = (
+            _make_v23_frame(b'TIT2', b'\x03Title')
+            + _make_v23_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(
+            3, frames, flags=0x40, extended_header=extended_header)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Title')
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3v24_extended_header(self) -> None:
+        # Extended header: 4-byte syncsafe size (including itself),
+        # 1 flag byte count, flag bytes
+        extended_header = _syncsafe(6) + b'\x01\x00'
+        frames = (
+            _make_v24_frame(b'TIT2', b'\x03Title')
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(
+            4, frames, flags=0x40, extended_header=extended_header)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Title')
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3v22_unsynchronisation(self) -> None:
+        frames = _make_v22_frame(b'TT2', b'\x00Bl\xff\xe0h')
+        tag_data = _make_id3v2_tag(2, frames, flags=0x80)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Blÿàh')
+        self.assertNotIn('title', tag.other)
+
+    def test_id3v23_unsynchronisation(self) -> None:
+        frames = (
+            _make_v23_frame(b'TIT2', b'\x00Bl\xff\xe0h')
+            + _make_v23_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(3, frames, flags=0x80)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Blÿàh')
+        self.assertEqual(tag.artist, 'Artist')
+        self.assertNotIn('title', tag.other)
+
+    def test_id3v24_frame_unsynchronisation(self) -> None:
+        frame_data = _unsync_encode(b'\x00Bl\xff\xe0h')
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x02)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Blÿàh')
+        self.assertEqual(tag.artist, 'Artist')
+        self.assertNotIn('title', tag.other)
+
+    def test_id3v24_tag_unsynchronisation(self) -> None:
+        # Tag-level unsynchronisation flag: all frames are unsynchronised
+        frames = (
+            _make_v24_frame(b'TIT2', _unsync_encode(b'\x00Bl\xff\xe0h'))
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames, flags=0x80)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Blÿàh')
+        self.assertEqual(tag.artist, 'Artist')
+        self.assertNotIn('title', tag.other)
+
+    def test_id3v23_compressed_frame(self) -> None:
+        frame_content = b'\x03Compressed Title'
+        frame_data = len(frame_content).to_bytes(4, 'big') + compress(
+            frame_content)
+        frames = (
+            _make_v23_frame(b'TIT2', frame_data, format_flags=0x80)
+            + _make_v23_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(3, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Compressed Title')
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3v24_compressed_frame(self) -> None:
+        frame_content = b'\x03Compressed Title'
+        frame_data = _syncsafe(len(frame_content)) + compress(frame_content)
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x08)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Compressed Title')
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3v24_data_length_indicator(self) -> None:
+        frame_content = b'\x03Title'
+        frame_data = _syncsafe(len(frame_content)) + frame_content
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x01)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.title, 'Title')
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3_compressed_frame_corrupt_data(self) -> None:
+        # Corrupt compressed data must not affect subsequent frames
+        frames = (
+            _make_v23_frame(b'TIT2', b'\x00\x00\x00\x10not zlib data',
+                            format_flags=0x80)
+            + _make_v23_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(3, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.artist, 'Artist')
+
+        frame_data = _syncsafe(16) + b'not zlib data'
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x08)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3_decompressed_size_limit(self) -> None:
+        # Frames decompressing to more than a few MiB are skipped
+        # pylint: disable=protected-access
+        max_size = _ID3._MAX_DECOMPRESSED_FRAME_SIZE
+        frame_content = b'\x03' + b'A' * max_size
+        frame_data = _syncsafe(len(frame_content)) + compress(frame_content)
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x08)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.artist, 'Artist')
+
+        # A data length indicator above the limit skips decompression
+        frame_data = _syncsafe(max_size + 1) + compress(b'\x03Title')
+        frames = (
+            _make_v24_frame(b'TIT2', frame_data, format_flags=0x08)
+            + _make_v24_frame(b'TPE1', b'\x03Artist'))
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertIsNone(tag.title)
+        self.assertEqual(tag.artist, 'Artist')
+
+    def test_id3v23_compressed_image(self) -> None:
+        image_data = b'\x89PNG\r\n\x1a\nimagedata'
+        frame_content = b'\x03image/png\x00\x03desc\x00' + image_data
+        frame_data = len(frame_content).to_bytes(4, 'big') + compress(
+            frame_content)
+        frames = _make_v23_frame(b'APIC', frame_data, format_flags=0x80)
+        tag_data = _make_id3v2_tag(3, frames)
+        tag = self._get_constructed_tag(tag_data, image=True)
+        image = tag.images.front_cover
+        assert image is not None
+        self.assertEqual(image.data, image_data)
+        self.assertEqual(image.mime_type, 'image/png')
+        self.assertEqual(image.description, 'desc')
+
+    def test_id3v24_compressed_unsynced_lyrics(self) -> None:
+        frame_content = b'\x00eng\x00lyr\xff\xe0ics'
+        frame_data = _syncsafe(len(frame_content)) + _unsync_encode(
+            compress(frame_content))
+        frames = _make_v24_frame(b'USLT', frame_data, format_flags=0x0A)
+        tag_data = _make_id3v2_tag(4, frames)
+        tag = self._get_constructed_tag(tag_data)
+        self.assertEqual(tag.other.get('lyrics'), ['lyrÿàics'])
 
     def test_show_hint_for_wrong_usage(self) -> None:
         with self.assertRaises(ValueError) as context:

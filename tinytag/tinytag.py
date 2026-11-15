@@ -35,6 +35,7 @@ from binascii import a2b_base64
 from io import BytesIO
 from os import PathLike, SEEK_CUR, SEEK_END, environ, fsdecode
 from struct import unpack, unpack_from
+from zlib import decompressobj, error as ZlibError
 
 TYPE_CHECKING = False
 
@@ -991,6 +992,16 @@ class _ID3(TinyTag):
     _VALID_STRING_ENCODINGS = {0x00, 0x01, 0x02, 0x03}
     _ID3V1_TAG_SIZE = 128
     _ID3V2_HEADER_SIZE = 10
+    # Upper bound for decompressing frames, to guard against zip bombs
+    _MAX_DECOMPRESSED_FRAME_SIZE = 8 * 1024 * 1024  # 8 MiB
+    # ID3v2.3 frame format flags (second flags byte)
+    _V23_FLAG_COMPRESSION = 0x80
+    # ID3v2.4 frame format flags (second flags byte)
+    _V24_FLAG_GROUPING = 0x40
+    _V24_FLAG_COMPRESSION = 0x08
+    _V24_FLAG_ENCRYPTION = 0x04
+    _V24_FLAG_UNSYNCHRONISATION = 0x02
+    _V24_FLAG_DATA_LENGTH_INDICATOR = 0x01
     _ID3V1_GENRES = (
         'Blues', 'Classic Rock', 'Country', 'Dance', 'Disco',
         'Funk', 'Grunge', 'Hip-Hop', 'Jazz', 'Metal', 'New Age', 'Oldies',
@@ -1066,6 +1077,7 @@ class _ID3(TinyTag):
     def __init__(self) -> None:
         super().__init__()
         self._only_id3 = False
+        self._unsync = False
         self._modern_grouping_values: list[str] = []
         self._legacy_grouping_values: list[str] = []
 
@@ -1075,7 +1087,7 @@ class _ID3(TinyTag):
         if self._parse_tags:
             tag_size = self._parse_id3v2(fh)
         elif self._parse_duration:
-            tag_size, _extended, _major = self._parse_id3v2_header(fh)
+            tag_size, _extended, _major, _unsync = self._parse_id3v2_header(fh)
         if tag_size > 0:
             audio_offset += self._ID3V2_HEADER_SIZE + tag_size
         fh.seek(audio_offset)
@@ -1114,37 +1126,66 @@ class _ID3(TinyTag):
         self._tags_parsed = self._parse_tags
         self._duration_parsed = self._parse_duration
 
-    def _parse_id3v2_header(self, fh: BinaryIO) -> tuple[int, bool, int]:
+    def _parse_id3v2_header(self, fh: BinaryIO) -> tuple[int, bool, int, bool]:
         size = major = 0
-        extended = False
+        extended = unsync = False
         # for info on the specs, see: http://id3.org/Developer%20Information
         header = fh.read(self._ID3V2_HEADER_SIZE)
         # check if there is an ID3v2 tag at the beginning of the file
         if (len(header) == self._ID3V2_HEADER_SIZE
                 and header.startswith(b'ID3')):
             major = header[3]
+            unsync = (header[5] & 0x80) > 0
             extended = (header[5] & 0x40) > 0
             size += self._unsynchsafe(header, 6)
             if _DEBUG:
                 print(f'Found id3 v2.{major} tag with size {size}')
-        return size, extended, major
+        return size, extended, major, unsync
+
+    def _skip_extended_header(self, fh: BinaryIO, major: int) -> int:
+        # Skip the extended header, returning the number of tag bytes
+        # it occupies. See:
+        # http://id3.org/id3v2.3.0#ID3v2_extended_header
+        # http://id3.org/id3v2.4.0-structure#31_ID3v2.4_extended_header
+        size_data = fh.read(4)
+        if len(size_data) < 4:
+            return 0
+        if major == 4:
+            # v2.4: syncsafe size, including the 4 size bytes themselves
+            extd_size = self._unsynchsafe(size_data)
+            skip_size = extd_size - 4
+        else:
+            # v2.3: regular 32-bit size, excluding the 4 size bytes
+            extd_size = unpack('>I', size_data)[0]
+            skip_size = extd_size
+            extd_size += 4
+        if skip_size > 0:
+            fh.seek(skip_size, SEEK_CUR)  # jump over extended header
+        return max(extd_size, 0)
 
     def _parse_id3v2(self, fh: BinaryIO) -> int:
-        size, extended, major = self._parse_id3v2_header(fh)
+        size, extended, major, self._unsync = self._parse_id3v2_header(fh)
         if size <= 0:
             return size
-        parsed_size = self._ID3V2_HEADER_SIZE
-        if extended:  # just read over the extended header.
-            extd_size = self._unsynchsafe(fh.read(6))
-            parsed_size += extd_size
-            fh.seek(extd_size - 6, SEEK_CUR)  # jump over extended_header
+        tag_size = size
+        if self._unsync and major < 4:
+            # ID3v2.2/v2.3 apply unsynchronisation to the tag as a whole,
+            # so frame sizes only match up after de-unsynchronisation.
+            # ID3v2.4 unsynchronises individual frames instead, which is
+            # handled in _parse_frame.
+            tag_data = self._remove_unsynchronisation(fh.read(size))
+            fh = BytesIO(tag_data)
+            size = len(tag_data)
+        parsed_size = 0
+        if extended and major >= 3:  # just read over the extended header
+            parsed_size += self._skip_extended_header(fh, major)
         while parsed_size < size:
             frame_size = self._parse_frame(fh, size, id3version=major)
             if frame_size == -1:
                 break
             parsed_size += frame_size
         self._set_grouping_work_fields()
-        return size
+        return tag_size
 
     def _parse_id3v1(self, fh: BinaryIO) -> bool:
         content = fh.read(128 if self._parse_tags else 3)
@@ -1291,6 +1332,59 @@ class _ID3(TinyTag):
             lyrics += f'[{timestamp}]{value}'
         return lyrics
 
+    @staticmethod
+    def _remove_unsynchronisation(data: bytes) -> bytes:
+        # Reverse the unsynchronisation scheme: a zero byte inserted
+        # after every 0xFF byte is removed again.
+        return data.replace(b'\xff\x00', b'\xff')
+
+    def _decompress_frame(self,
+                          data: bytes,
+                          expected_size: int | None) -> bytes | None:
+        max_size = self._MAX_DECOMPRESSED_FRAME_SIZE
+        if expected_size is not None and expected_size > max_size:
+            return None
+        try:
+            decompressor = decompressobj()
+            content = decompressor.decompress(data, max_size + 1)
+            if decompressor.unconsumed_tail:
+                # Decompressed data exceeds the size limit
+                return None
+            return content
+        except ZlibError:
+            # Corrupt compressed data, skip this frame
+            return None
+
+    def _decode_frame_content(self,
+                              content: bytes,
+                              format_flags: int,
+                              id3version: int | None) -> bytes | None:
+        # Undo frame-level transformations (data length indicator,
+        # unsynchronisation, compression) in reverse order of how they
+        # were applied when writing the tag.
+        decompressed_size = None
+        compressed = False
+        if id3version == 4:
+            compressed = bool(format_flags & self._V24_FLAG_COMPRESSION)
+            if ((compressed
+                    or format_flags & self._V24_FLAG_DATA_LENGTH_INDICATOR)
+                    and len(content) >= 4):
+                # data length indicator: decompressed size as syncsafe int
+                decompressed_size = self._unsynchsafe(content)
+                content = content[4:]
+            if (format_flags & self._V24_FLAG_UNSYNCHRONISATION
+                    or self._unsync):
+                content = self._remove_unsynchronisation(content)
+        elif id3version == 3 and format_flags & self._V23_FLAG_COMPRESSION:
+            compressed = True
+            if len(content) >= 4:
+                # decompressed size as regular 32-bit int
+                decompressed_size = unpack_from('>I', content)[0]
+                content = content[4:]
+        if compressed:
+            return self._decompress_frame(content, decompressed_size)
+        return content
+
     def _parse_frame(self,
                      fh: BinaryIO,
                      total_size: int,
@@ -1312,6 +1406,7 @@ class _ID3(TinyTag):
             frame_size = self._unsynchsafe(header, 4)
         else:
             frame_size = unpack_from('>I', header, 4)[0]
+        format_flags = header[9] if id3version in {3, 4} else 0
         parsed_size += frame_size
         if _DEBUG:
             print(f'Found id3 Frame {frame_id!r} at '
@@ -1321,9 +1416,25 @@ class _ID3(TinyTag):
         if frame_size > total_size:
             # invalid frame size, stop here
             return -1
+        is_image_frame = frame_id in self._IMAGE_FRAME_IDS
+        parses_frame = (
+            self._parse_tags and (
+                frame_id in self._ID3_MAPPING
+                or frame_id in self._SYNCED_LYRICS_FRAME_IDS
+                or frame_id in self._CUSTOM_FRAME_IDS
+                or frame_id == b'PRIV'
+                or frame_id not in self._IGNORED_FRAME_IDS
+            )
+        ) or (self._load_image and is_image_frame)
+        if not parses_frame:  # skip frame
+            fh.seek(frame_size, SEEK_CUR)
+            return parsed_size
+        content = self._decode_frame_content(
+            fh.read(frame_size), format_flags, id3version)
+        if not content:  # corrupt or empty frame, skip it
+            return parsed_size
         if self._parse_tags and frame_id in self._ID3_MAPPING:
             fieldname = self._ID3_MAPPING[frame_id]
-            content = fh.read(frame_size)
             if fieldname in {'comment', 'other.lyrics'}:
                 encoding = content[0]
                 content = content[4:]
@@ -1380,12 +1491,10 @@ class _ID3(TinyTag):
                 else:
                     self._set_field(fieldname, value)
         elif self._parse_tags and frame_id in self._SYNCED_LYRICS_FRAME_IDS:
-            content = fh.read(frame_size)
             lyrics = self._parse_synced_lyrics(content)
             self._set_other_field('lyrics', lyrics)
         elif self._parse_tags and frame_id in self._CUSTOM_FRAME_IDS:
             # custom fields
-            content = fh.read(frame_size)
             encoding = content[0]
             end_pos = self._find_string_end_pos(
                 content, encoding, start_pos=1)
@@ -1394,7 +1503,6 @@ class _ID3(TinyTag):
             if description and value:
                 self._set_custom_field(description, value)
         elif self._parse_tags and frame_id == b'PRIV':
-            content = fh.read(frame_size)
             owner_id_end_pos = self._find_string_end_pos(content)
             owner_id = content[:owner_id_end_pos - 1]
             if owner_id == b'XMP':
@@ -1403,7 +1511,6 @@ class _ID3(TinyTag):
                 self._set_other_field('xmp', value)
         elif self._parse_tags and frame_id not in self._IGNORED_FRAME_IDS:
             # unknown, try to add to other dict
-            content = fh.read(frame_size)
             encoding = content[0]
             if encoding in self._VALID_STRING_ENCODINGS:
                 value = self._decode_string(content[1:], encoding)
@@ -1413,12 +1520,9 @@ class _ID3(TinyTag):
                 self._OTHER_PREFIX + frame_id.decode('latin-1').lower(),
                 value)
         elif self._load_image and frame_id in self._IMAGE_FRAME_IDS:
-            content = fh.read(frame_size)
             field_name, image = self._parse_image(frame_id, content)
             # pylint: disable=protected-access
             self.images._set_field(field_name, image)
-        else:  # skip frame
-            fh.seek(frame_size, SEEK_CUR)
         return parsed_size
 
     @staticmethod
