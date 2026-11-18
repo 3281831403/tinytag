@@ -41,7 +41,24 @@ TYPE_CHECKING = False
 # Lazy imports for type checking
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
-    from typing import Any, BinaryIO, Dict, List, Tuple, Union
+    from typing import Any, BinaryIO, Dict, List, Tuple, TypedDict, Union
+
+    class _OggStreamState(TypedDict):
+        # index of the chained segment this stream belongs to
+        chain_index: int
+        # reassembly buffer for packets spanning multiple pages
+        packet_data: bytearray
+        granule_pos: int       # granule position of the last page
+        last_granule_pos: int  # granule position of the previous page
+        audio_size: int        # confirmed audio bytes of this segment
+        last_audio_size: int   # audio bytes pending confirmation
+        is_opus: bool          # opus stream: its packets are audio data
+        headers_done: bool     # codec setup packets were collected
+        eos_seen: bool
+        # codec parameters of this chained segment
+        samplerate: int
+        preskip: int
+        is_flac: bool
 
     _StringListDict = Dict[str, List[str]]
     _ImageListDict = Dict[str, List['Image']]
@@ -54,6 +71,9 @@ if TYPE_CHECKING:
     _AtomTreeDict = Dict[bytes, Union['_AtomTreeDict', _AtomParser]]
 else:
     _StringListDict = _ImageListDict = dict
+
+    class _OggStreamState(dict):  # type: ignore[no-redef]
+        pass
 
 # some of the parsers can print debug info
 _DEBUG = bool(environ.get('TINYTAG_DEBUG'))
@@ -1712,120 +1732,186 @@ class _Ogg(TinyTag):
 
     def __init__(self) -> None:
         super().__init__()
-        self._granule_pos = 0
         self._audio_size = 0  # size of opus audio stream
         self._granule_pos_serial: int | None = None
-        self._audio_size_serial: int | None = None
+        # state of every logical stream, keyed by its Ogg serial number
+        self._stream_state: dict[int, _OggStreamState] = {}
 
     def _parse(self, fh: BinaryIO) -> None:
         check_flac_second_packet = False
         check_speex_second_packet = False
-        preskip = 0  # number of samples to skip in opus stream
-        for packet, serial in self._parse_pages(fh):
-            if packet.startswith(b'\x01vorbis'):
-                if self._parse_duration:
-                    channels, samplerate = unpack_from('<Bi', packet, 11)
-                    bitrate = unpack_from('<i', packet, 20)[0]
-                    if channels > 0:
-                        self.channels = channels
-                    if samplerate > 0:
-                        self.samplerate = samplerate
-                    if bitrate > 0:
-                        self.bitrate = bitrate / 1000
-                    self.mime_type = 'audio/ogg; codecs="vorbis"'
-                    self.is_lossless = False
-                    self._granule_pos_serial = serial
-                    self._duration_parsed = True
-            elif packet.startswith(b'\x03vorbis'):
-                if self._parse_tags:
-                    walker = BytesIO(packet)
-                    walker.seek(7)  # jump over header name
-                    self._set_vorbis_comment_fields(walker)
-                    self._tags_parsed = True
-            elif packet.startswith(b'OpusHead'):
-                if self._parse_duration:  # parse opus header
-                    # https://www.videolan.org/developers/vlc/modules/codec/opus_header.c
-                    # https://mf4.xiph.org/jenkins/view/opus/job/opusfile-unix/ws/doc/html/structOpusHead.html
-                    version, channels, preskip = unpack_from('<BBH', packet, 8)
-                    if (version & 0xF0) == 0:  # only major version 0 supported
-                        if channels > 0:
-                            self.channels = channels
-                        self.samplerate = 48000
-                    self.mime_type = 'audio/ogg; codecs="opus"'
-                    self.is_lossless = False
-                    self._duration_parsed = True
-                    self._granule_pos_serial = serial
-            elif packet.startswith(b'OpusTags'):
-                if self._parse_tags:  # parse opus metadata:
-                    walker = BytesIO(packet)
-                    walker.seek(8)  # jump over header name
-                    self._set_vorbis_comment_fields(walker)
-                    self._tags_parsed = True
-                self._audio_size_serial = serial
-            elif packet.startswith(b'\x7FFLAC'):
-                # https://xiph.org/flac/ogg_mapping.html
-                walker = BytesIO(packet)
-                # jump over header name, version and number of headers
-                walker.seek(9)
-                # pylint: disable=protected-access
-                flactag = _Flac()
-                flactag.filename = self.filename
-                flactag.filesize = self.filesize
-                flactag._filehandler = walker
-                flactag._load(
-                    tags=False, duration=self._parse_duration,
-                    image=self._load_image)
-                self._update(flactag)
-                if self._parse_duration:
-                    self.mime_type = 'audio/ogg; codecs="flac"'
-                    self.is_lossless = True
-                self._duration_parsed = self._parse_duration
-                check_flac_second_packet = True
-            elif check_flac_second_packet:
-                # second packet contains FLAC metadata block
-                if self._parse_tags:
-                    walker = BytesIO(packet)
-                    meta_header = walker.read(4)
-                    block_type = meta_header[0] & 0x7f
-                    # pylint: disable=protected-access
-                    if block_type == _Flac._VORBIS_COMMENT:
+        # A physical Ogg file may contain several sequential logical streams
+        # (chained Ogg). Every segment has its own codec headers, pre-skip
+        # and granule positions, so all per-segment state is kept in the
+        # stream states of _parse_pages, keyed by the Ogg serial number.
+        # Parallel streams (e.g. audio + video in an .ogv container) use
+        # different serials and therefore never interfere with each other.
+        for packets, serial, _is_bos, is_eos in self._parse_pages(fh):
+            stream = self._stream_state[serial]
+            # tags and file-level codec parameters come from the first chain
+            # only; parallel streams within it are all chain index 0, while
+            # later chained segments have higher indices
+            is_first_chain = stream['chain_index'] == 0
+            for packet in packets:
+                if packet.startswith(b'\x01vorbis'):
+                    if self._parse_duration:
+                        channels, samplerate = unpack_from('<Bi', packet, 11)
+                        bitrate = unpack_from('<i', packet, 20)[0]
+                        if is_first_chain:
+                            # codec parameters of the first segment represent
+                            # the whole file, later segments must not overwrite
+                            # them
+                            if channels > 0:
+                                self.channels = channels
+                            if bitrate > 0:
+                                self.bitrate = bitrate / 1000
+                        if samplerate > 0:
+                            stream['samplerate'] = samplerate
+                            if is_first_chain:
+                                self.samplerate = samplerate
+                        self.mime_type = 'audio/ogg; codecs="vorbis"'
+                        self.is_lossless = False
+                        self._granule_pos_serial = serial
+                        self._duration_parsed = True
+                elif packet.startswith(b'\x03vorbis'):
+                    # the comment header ends this stream's setup phase
+                    stream['headers_done'] = True
+                    if self._parse_tags and is_first_chain:
+                        # only tags of the first segment are kept
+                        walker = BytesIO(packet)
+                        walker.seek(7)  # jump over header name
                         self._set_vorbis_comment_fields(walker)
-                    self._tags_parsed = True
-                check_flac_second_packet = False
-            elif packet.startswith(b'Speex   '):
-                # https://speex.org/docs/manual/speex-manual/node8.html
-                if self._parse_duration:
-                    samplerate = unpack_from('<i', packet, 36)[0]
-                    channels, bitrate = unpack_from('<ii', packet, 48)
-                    if samplerate > 0:
-                        self.samplerate = samplerate
-                    if channels > 0:
-                        self.channels = channels
-                    if bitrate > 0:
-                        self.bitrate = bitrate / 1000
-                    self.mime_type = 'audio/ogg; codecs="speex"'
-                    self.is_lossless = False
-                    self._granule_pos_serial = serial
-                    self._duration_parsed = True
-                check_speex_second_packet = True
-            elif check_speex_second_packet:
-                if self._parse_tags:
+                        self._tags_parsed = True
+                elif packet.startswith(b'OpusHead'):
+                    if self._parse_duration:  # parse opus header
+                        # https://www.videolan.org/developers/vlc/modules/codec/opus_header.c
+                        # https://mf4.xiph.org/jenkins/view/opus/job/opusfile-unix/ws/doc/html/structOpusHead.html
+                        version, channels, header_preskip = unpack_from(
+                            '<BBH', packet, 8
+                        )
+                        if (version & 0xF0) == 0:
+                            # only major version 0 supported
+                            if is_first_chain:
+                                if channels > 0:
+                                    self.channels = channels
+                                self.samplerate = 48000
+                            # every chained segment has its own pre-skip
+                            stream['preskip'] = header_preskip
+                            stream['samplerate'] = 48000
+                        self.mime_type = 'audio/ogg; codecs="opus"'
+                        self.is_lossless = False
+                        self._duration_parsed = True
+                        self._granule_pos_serial = serial
+                elif packet.startswith(b'OpusTags'):
+                    # the tags packet marks the opus stream whose audio bytes
+                    # are counted and ends its setup phase; this applies to
+                    # every chained segment
+                    stream['is_opus'] = True
+                    stream['headers_done'] = True
+                    if self._parse_tags and is_first_chain:
+                        # parse opus metadata of the first segment only:
+                        # tags of further chained segments must not leak in
+                        walker = BytesIO(packet)
+                        walker.seek(8)  # jump over header name
+                        self._set_vorbis_comment_fields(walker)
+                        self._tags_parsed = True
+                elif packet.startswith(b'\x7FFLAC'):
+                    # https://xiph.org/flac/ogg_mapping.html
                     walker = BytesIO(packet)
-                    self._set_vorbis_comment_fields(walker)
-                    self._tags_parsed = True
-                check_speex_second_packet = False
+                    # jump over header name, version and number of headers
+                    walker.seek(9)
+                    # pylint: disable=protected-access
+                    flactag = _Flac()
+                    flactag.filename = self.filename
+                    flactag.filesize = self.filesize
+                    flactag._filehandler = walker
+                    flactag._load(
+                        tags=False, duration=self._parse_duration,
+                        image=self._load_image)
+                    if is_first_chain:
+                        self._update(flactag)
+                    if self._parse_duration:
+                        self.mime_type = 'audio/ogg; codecs="flac"'
+                        self.is_lossless = True
+                    self._duration_parsed = self._parse_duration
+                    stream['is_flac'] = True
+                    check_flac_second_packet = True
+                elif check_flac_second_packet:
+                    # second packet contains FLAC metadata block and ends
+                    # this stream's setup phase
+                    stream['headers_done'] = True
+                    if self._parse_tags and is_first_chain:
+                        walker = BytesIO(packet)
+                        meta_header = walker.read(4)
+                        block_type = meta_header[0] & 0x7f
+                        # pylint: disable=protected-access
+                        if block_type == _Flac._VORBIS_COMMENT:
+                            self._set_vorbis_comment_fields(walker)
+                        self._tags_parsed = True
+                    check_flac_second_packet = False
+                elif packet.startswith(b'Speex   '):
+                    # https://speex.org/docs/manual/speex-manual/node8.html
+                    if self._parse_duration:
+                        samplerate = unpack_from('<i', packet, 36)[0]
+                        channels, bitrate = unpack_from('<ii', packet, 48)
+                        if is_first_chain:
+                            if channels > 0:
+                                self.channels = channels
+                            if bitrate > 0:
+                                self.bitrate = bitrate / 1000
+                        if samplerate > 0:
+                            stream['samplerate'] = samplerate
+                            if is_first_chain:
+                                self.samplerate = samplerate
+                        self.mime_type = 'audio/ogg; codecs="speex"'
+                        self.is_lossless = False
+                        self._granule_pos_serial = serial
+                        self._duration_parsed = True
+                    check_speex_second_packet = True
+                elif check_speex_second_packet:
+                    # the comment packet ends this stream's setup phase
+                    stream['headers_done'] = True
+                    if self._parse_tags and is_first_chain:
+                        walker = BytesIO(packet)
+                        self._set_vorbis_comment_fields(walker)
+                        self._tags_parsed = True
+                    check_speex_second_packet = False
+            if is_eos:
+                # the page event already carries the final state of the page
+                self._finalize_ogg_chain(stream)
             if self._tags_parsed and not self._parse_duration:
-                # Optimization: If we need to determine the duration, read
-                # granule_pos of remaining pages, but skip contents of
-                # segments. If we don't need the duration, stop here.
+                # Optimization: duration is not requested, so there is no
+                # need to walk the remaining pages.
                 break
         if self.duration is not None or not self.samplerate:
             return  # either ogg flac or invalid file
-        self.duration = max(
-            (self._granule_pos - preskip) / self.samplerate, 0
+        # The stream providing the duration did not end with an EOS page
+        # (e.g. a truncated file). Use the granule position of its last page,
+        # preserving the previous behavior for a single logical stream.
+        final_stream = self._stream_state.get(
+            self._granule_pos_serial or -1
         )
-        if self._audio_size and self.duration:  # opus file
+        if final_stream is not None and not final_stream['eos_seen']:
+            self._finalize_ogg_chain(final_stream)
+
+    def _finalize_ogg_chain(self, stream: _OggStreamState) -> None:
+        """Add the duration of one finished chained segment to the total."""
+        if stream['is_flac'] or not stream['samplerate']:
+            # Ogg FLAC determines its duration itself; segments without a
+            # valid codec header are ignored like in the single-stream case.
+            return
+        segment_duration = max(
+            (stream['granule_pos'] - stream['preskip'])
+            / stream['samplerate'],
+            0
+        )
+        self.duration = (self.duration or 0.0) + segment_duration
+        if stream['audio_size']:  # opus stream with audio packets
+            self._audio_size += stream['audio_size']
+        if self._audio_size and self.duration:
+            # opus bitrate is calculated from the whole file's audio bytes
             self.bitrate = self._audio_size * 8 / self.duration / 1000
+
 
     @classmethod
     def _parse_vorbis_comment(
@@ -1885,17 +1971,50 @@ class _Ogg(TinyTag):
                 continue
             self._set_field(fieldname, value)
 
-    def _parse_pages(self, fh: BinaryIO) -> Iterator[tuple[bytearray, int]]:
+    @staticmethod
+    def _new_stream_state(chain_index: int) -> _OggStreamState:
+        return {
+            # index of the chained segment this stream belongs to. Parallel
+            # streams (different serials starting together) share index 0;
+            # a BOS page reusing an existing serial starts the next chain.
+            'chain_index': chain_index,
+            # reassembly buffer for packets spanning multiple pages
+            'packet_data': bytearray(),
+            'granule_pos': 0,       # granule position of the last page
+            'last_granule_pos': 0,  # granule position of the previous page
+            'audio_size': 0,        # confirmed audio bytes of this segment
+            'last_audio_size': 0,   # audio bytes pending confirmation
+            'is_opus': False,       # opus stream: its packets are audio data
+            'headers_done': False,  # codec setup packets were collected
+            'eos_seen': False,
+            # codec parameters of this chained segment
+            'samplerate': 0,
+            'preskip': 0,
+            'is_flac': False,
+        }
+
+    def _parse_pages(
+        self, fh: BinaryIO
+    ) -> Iterator[tuple[list[bytearray], int, bool, bool]]:
         # for the spec, see: https://wiki.xiph.org/Ogg
-        packets: dict[int, bytearray] = {}
-        last_granule_pos = 0
-        last_audio_size = 0
+        # Yields one event per Ogg page: (completed packets, serial,
+        # beginning-of-stream, end-of-stream). Page-level bookkeeping
+        # (granule positions, audio sizes) is done internally for every
+        # logical stream and is independent of whether the consumer still
+        # needs packet contents, so a consumer can stop looking at packets
+        # after the tags while duration collection continues.
         header_len = 27
         page_header = fh.read(header_len)  # read ogg page header
         if (not page_header.startswith(b'OggS')
                 or not page_header.startswith(b'\x00', 4)):
             raise ParseError('Invalid OGG header')
         self.mime_type = 'audio/ogg'
+        chain_index = 0
+        # Whether any logical stream has left its initial BOS group. Parallel
+        # streams place all their BOS pages back-to-back at the very start,
+        # before any data page; a BOS page encountered later begins another
+        # chained segment (which may reuse the serial or pick a new one).
+        data_started = False
         while len(page_header) == header_len:
             version = page_header[4]
             if not page_header.startswith(b'OggS') or version != 0:
@@ -1903,43 +2022,96 @@ class _Ogg(TinyTag):
                 break
             # https://xiph.org/ogg/doc/framing.html
             header_type = page_header[5]
-            eos = header_type & 0x04
+            is_bos = bool(header_type & 0x02)
+            is_eos = bool(header_type & 0x04)
             granule_pos, serial = unpack_from('<qI', page_header, 6)
-            if serial not in packets:
-                packets[serial] = bytearray()
-            packet_data = packets[serial]
-            audio_size_serial_match = serial == self._audio_size_serial
-            if serial == self._granule_pos_serial:
-                if eos:
-                    self._granule_pos = granule_pos
-                else:
-                    self._granule_pos = last_granule_pos
-                    last_granule_pos = granule_pos
+            if is_bos:
+                if data_started:
+                    # this BOS starts another chained segment
+                    chain_index += 1
+                elif serial in self._stream_state:
+                    # another BOS for an already seen serial in the initial
+                    # BOS group also starts a new chain
+                    chain_index += 1
+                # Chained segments may reuse the same serial number, so its
+                # state starts over.
+                self._stream_state[serial] = (
+                    self._new_stream_state(chain_index)
+                )
+            stream = self._stream_state.get(serial)
+            if stream is None:
+                # page without a preceding BOS page: start tracking it
+                stream = self._new_stream_state(chain_index)
+                self._stream_state[serial] = stream
+                is_bos = True
+            if not is_bos:
+                # a non-BOS page means the initial BOS group is over
+                data_started = True
+            packet_data = stream['packet_data']
             segments = page_header[26]
             seg_sizes = fh.read(segments)
-            read_size = 0
-            audio_size = 0
+            completed_packets: list[bytearray] = []
+            packet_size = 0
+            # audio bytes of packets completed on this page
+            page_audio_size = 0
+            # Codec setup packets (identification + comment headers) must
+            # stay available even after the tags of the first chain were
+            # parsed, so later chained segments can provide their own header
+            # parameters. Each stream's packets are collected until its
+            # setup phase is over; afterwards the original optimization of
+            # skipping packet contents applies.
+            collect_packets = (
+                not stream['headers_done'] or not self._tags_parsed
+            )
             for seg_size in seg_sizes:  # read all segments
-                read_size += seg_size
-                if audio_size_serial_match:
-                    audio_size += seg_size
-                # less than 255 bytes means end of packet
-                if seg_size < 255 and not self._tags_parsed:
-                    packet_data += fh.read(read_size)
-                    yield packet_data, serial
-                    packet_data.clear()
-                    read_size = 0
-            if read_size > 0:
-                if self._tags_parsed and self._duration_parsed:
-                    fh.seek(read_size, SEEK_CUR)
-                else:  # packet continues on next page
-                    packet_data += fh.read(read_size)
-            if audio_size_serial_match:
-                if eos:
-                    self._audio_size += last_audio_size + audio_size
+                packet_size += seg_size
+                if seg_size < 255:
+                    # end of packet: consume its bytes from the file
+                    packet_bytes = fh.read(packet_size)
+                    if collect_packets:
+                        packet_data += packet_bytes
+                        completed_packets.append(bytearray(packet_data))
+                        packet_data.clear()
+                    if stream['is_opus']:
+                        page_audio_size += packet_size
+                    packet_size = 0
+            if packet_size > 0:
+                # the last packet spans into the next page
+                if not collect_packets and self._duration_parsed:
+                    fh.seek(packet_size, SEEK_CUR)
                 else:
-                    self._audio_size += last_audio_size
-                    last_audio_size = audio_size
+                    packet_data += fh.read(packet_size)
+            if stream['is_opus']:
+                # Delay audio accounting by one page: bytes of packets
+                # completed on this page are only confirmed once another page
+                # follows, so a dangling packet at the end of a truncated file
+                # (no EOS) is never counted. On an EOS page the granule
+                # position covers all of its packets, so its bytes count too.
+                if is_eos:
+                    stream['audio_size'] = (
+                        stream['audio_size']
+                        + stream['last_audio_size'] + page_audio_size
+                    )
+                else:
+                    stream['audio_size'] = (
+                        stream['audio_size']
+                        + stream['last_audio_size']
+                    )
+                    stream['last_audio_size'] = page_audio_size
+            # Granule positions are tracked for every logical stream; the
+            # codec handling in _parse decides which serial's values are used.
+            # This must not wait for _granule_pos_serial, which is only set
+            # when the codec header packet is consumed.
+            if is_eos:
+                # the EOS page's granule position covers all its packets
+                stream['granule_pos'] = granule_pos
+            else:
+                # the granule position only covers completed packets, so it
+                # becomes valid on the following page
+                stream['granule_pos'] = stream['last_granule_pos']
+                stream['last_granule_pos'] = granule_pos
+            stream['eos_seen'] = stream['eos_seen'] or is_eos
+            yield completed_packets, serial, is_bos, is_eos
             page_header = fh.read(header_len)
 
 

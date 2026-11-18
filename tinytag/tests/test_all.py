@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os.path
+import struct
 
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
@@ -3242,6 +3243,111 @@ IMAGE_TEST_FILES: dict[str, ExpectedImages] = dict([
 SAMPLE_FOLDER = os.path.join(os.path.dirname(__file__), 'samples')
 
 
+def _ogg_page(serial: int, packets: list[bytes], granule_pos: int = 0,
+              bos: bool = False, eos: bool = False) -> bytes:
+    """Build an Ogg page from fixed bytes (CRC is left zero)."""
+    header_type = (0x02 if bos else 0) | (0x04 if eos else 0)
+    seg_table = bytearray()
+    body = bytearray()
+    for index, packet in enumerate(packets):
+        body += packet
+        remaining = len(packet)
+        while remaining >= 255:
+            seg_table.append(255)
+            remaining -= 255
+        # a final lacing value terminates every packet, including a zero
+        # value when the last packet ends on a 255-byte boundary
+        if index == len(packets) - 1 or remaining > 0:
+            seg_table.append(remaining)
+    header = bytearray(b'OggS')
+    header.append(0)                                   # version
+    header.append(header_type)
+    header += struct.pack('<q', granule_pos)
+    header += struct.pack('<I', serial)
+    header += struct.pack('<I', 0)                    # page sequence number
+    header += struct.pack('<I', 0)                    # CRC
+    header.append(len(seg_table))
+    return bytes(header) + bytes(seg_table) + bytes(body)
+
+
+def _opus_head_packet(channels: int, preskip: int) -> bytes:
+    packet = bytearray(b'OpusHead')
+    packet.append(1)                                  # version
+    packet.append(channels)
+    packet += struct.pack('<H', preskip)
+    packet += struct.pack('<I', 48000)               # input sample rate
+    packet += struct.pack('<H', 0)                   # output gain
+    packet.append(0)                                  # channel mapping family
+    return bytes(packet)
+
+
+def _vorbis_id_packet(channels: int, samplerate: int,
+                      bitrate: int) -> bytes:
+    packet = bytearray(b'\x01vorbis')
+    packet += struct.pack('<I', 0)                   # vorbis version
+    packet.append(channels)
+    packet += struct.pack('<I', samplerate)
+    packet += struct.pack('<iii', bitrate, bitrate, bitrate)
+    packet.append(0xb8)                              # blocksizes
+    packet.append(1)                                 # framing flag
+    return bytes(packet)
+
+
+def _comment_packet(magic: bytes, comments: list[tuple[bytes, bytes]]) -> bytes:
+    packet = bytearray(magic)
+    vendor = b'tinytag-test'
+    packet += struct.pack('<I', len(vendor))
+    packet += vendor
+    packet += struct.pack('<I', len(comments))
+    for key, value in comments:
+        field = key + b'=' + value
+        packet += struct.pack('<I', len(field))
+        packet += field
+    return bytes(packet)
+
+
+def _build_chained_opus(
+    segments: list[tuple[int, int, list[int], int, list[tuple[bytes, bytes]]]]
+) -> bytes:
+    """Each segment is (serial, preskip, audio_sizes, granule, comments)."""
+    pages = bytearray()
+    for serial, preskip, audio_sizes, granule, comments in segments:
+        pages += _ogg_page(
+            serial, [_opus_head_packet(1, preskip)], bos=True
+        )
+        pages += _ogg_page(
+            serial, [_comment_packet(b'OpusTags', comments)]
+        )
+        pages += _ogg_page(
+            serial, [b'\xfc' * size for size in audio_sizes],
+            granule_pos=granule, eos=True
+        )
+    return bytes(pages)
+
+
+def _build_chained_vorbis(
+    segments: list[
+        tuple[int, int, int, list[int], int, list[tuple[bytes, bytes]]]
+    ]
+) -> bytes:
+    """Each segment is (serial, samplerate, bitrate, audio_sizes, granule,
+    comments)."""
+    pages = bytearray()
+    for (serial, samplerate, bitrate, audio_sizes, granule,
+         comments) in segments:
+        pages += _ogg_page(
+            serial, [_vorbis_id_packet(1, samplerate, bitrate)], bos=True
+        )
+        pages += _ogg_page(
+            serial, [_comment_packet(b'\x03vorbis', comments)]
+        )
+        pages += _ogg_page(
+            serial, [b'\x00' * size for size in audio_sizes],
+            granule_pos=granule, eos=True
+        )
+    return bytes(pages)
+
+
 class TestAll(TestCase):
 
     @classmethod
@@ -3375,6 +3481,97 @@ class TestAll(TestCase):
                 }
                 self.compare_tag(results, filtered_expected)
                 assert tag.images.any is None
+
+    def test_chained_opus_stream(self) -> None:
+        # Two sequential Opus logical streams in one physical Ogg file, built
+        # from fixed bytes. Each segment uses its own pre-skip; the duration
+        # is the sum of both segments according to their own header values.
+        preskip = 312
+        data = _build_chained_opus([
+            # serial, preskip, audio packet sizes, granule position, tags
+            (0x11111111, preskip, [100, 200], 48000,
+             [(b'TITLE', b'first-segment'), (b'ARTIST', b'artist-one')]),
+            (0x22222222, preskip, [300], 96000,
+             [(b'TITLE', b'second-segment')]),
+        ])
+        expected_duration = (
+            (48000 - preskip) / 48000 + (96000 - preskip) / 48000
+        )
+        # all 600 audio bytes of both segments are counted for the
+        # whole-file bitrate
+        expected_audio_size = 100 + 200 + 300
+        expected_bitrate = (
+            expected_audio_size * 8 / expected_duration / 1000
+        )
+        tag = TinyTag.get(file_obj=BytesIO(data))
+        assert tag.duration is not None
+        assert tag.bitrate is not None
+        self.assertAlmostEqual(tag.duration, expected_duration)
+        self.assertEqual(tag.samplerate, 48000)
+        self.assertEqual(tag.channels, 1)
+        self.assertAlmostEqual(tag.bitrate, expected_bitrate)
+        # metadata comes from the first segment only, later tags must not
+        # leak into it
+        self.assertEqual(tag.title, 'first-segment')
+        self.assertEqual(tag.artist, 'artist-one')
+        # the bitrate must not depend on whether tags are requested
+        tag_duration_only = TinyTag.get(
+            file_obj=BytesIO(data), tags=False, duration=True
+        )
+        assert tag_duration_only.duration is not None
+        assert tag_duration_only.bitrate is not None
+        self.assertAlmostEqual(
+            tag_duration_only.duration, expected_duration
+        )
+        self.assertAlmostEqual(
+            tag_duration_only.bitrate, expected_bitrate
+        )
+        self.assertIsNone(tag_duration_only.title)
+
+    def test_chained_opus_distinct_preskip(self) -> None:
+        # A segment without pre-skip must be handled using its own header
+        # value rather than the pre-skip of the first segment.
+        data = _build_chained_opus([
+            (0x33333333, 312, [100], 48000, [(b'TITLE', b'a')]),
+            (0x44444444, 0, [100], 48000, [(b'TITLE', b'b')]),
+        ])
+        expected_duration = (48000 - 312) / 48000 + 48000 / 48000
+        tag = TinyTag.get(file_obj=BytesIO(data))
+        assert tag.duration is not None
+        self.assertAlmostEqual(tag.duration, expected_duration)
+        self.assertEqual(tag.title, 'a')
+
+    def test_chained_vorbis_stream(self) -> None:
+        # Two sequential Vorbis streams with different sample rates. The
+        # duration of every segment is computed from its own identification
+        # header, while file-level properties and tags use the first segment.
+        data = _build_chained_vorbis([
+            # serial, samplerate, bitrate, audio sizes, granule, tags
+            (0xaaaaaaaa, 8000, 64000, [100, 100], 8000,
+             [(b'TITLE', b'one'), (b'ARTIST', b'art1')]),
+            (0xbbbbbbbb, 6000, 32000, [150], 12000,
+             [(b'TITLE', b'two')]),
+        ])
+        tag = TinyTag.get(file_obj=BytesIO(data))
+        # 8000/8000 (1 s) + 12000/6000 (2 s)
+        assert tag.duration is not None
+        self.assertAlmostEqual(tag.duration, 3.0)
+        self.assertEqual(tag.samplerate, 8000)
+        self.assertEqual(tag.channels, 1)
+        self.assertEqual(tag.bitrate, 64.0)
+        self.assertEqual(tag.title, 'one')
+        self.assertEqual(tag.artist, 'art1')
+        tag_duration_only = TinyTag.get(
+            file_obj=BytesIO(data), tags=False, duration=True
+        )
+        assert tag_duration_only.duration is not None
+        self.assertAlmostEqual(tag_duration_only.duration, 3.0)
+        self.assertIsNone(tag_duration_only.title)
+        tag_tags_only = TinyTag.get(
+            file_obj=BytesIO(data), tags=True, duration=False
+        )
+        self.assertIsNone(tag_tags_only.duration)
+        self.assertEqual(tag_tags_only.title, 'one')
 
     def test_file_reading_images(self) -> None:
         for testfile, expected in IMAGE_TEST_FILES.items():
